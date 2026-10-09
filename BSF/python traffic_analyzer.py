@@ -14,16 +14,27 @@ from collections import Counter, defaultdict
 from datetime import datetime
 import struct
 import base64
+import binascii
+import html as html_lib  # 'html' is also a generate_report() parameter
 import random  # For dummy generation
 
 # PCAP Constants (from libpcap format)
-PCAP_MAGIC = 0xa1b2c3d4  # Little-endian
+PCAP_MAGIC = 0xa1b2c3d4  # Microsecond timestamps
+PCAP_MAGIC_NS = 0xa1b23c4d  # Nanosecond timestamps
+LINKTYPE_ETHERNET = 1
+ETHERTYPE_IPV4 = 0x0800
+ETHERTYPE_VLAN = (0x8100, 0x88a8)  # 802.1Q and 802.1ad (QinQ)
+VLAN_TAG_SIZE = 4
 PCAP_HEADER_SIZE = 24
 PCAP_PACKET_HEADER_SIZE = 16
 ETH_HEADER_SIZE = 14
 IP_HEADER_MIN_SIZE = 20
 TCP_HEADER_MIN_SIZE = 20
 UDP_HEADER_SIZE = 8
+
+# Anomaly thresholds
+DOS_RATE_THRESHOLD = 500  # packets per minute from one source
+DOS_MIN_PACKETS = 20  # need enough samples before judging a rate
 
 DUMMY_PCAP = 'dummy.pcap'
 
@@ -48,15 +59,16 @@ def generate_dummy_pcap(filename=DUMMY_PCAP, num_packets=50):
         for i in range(num_packets):
             # Fake Ethernet + IP + TCP payload (simplified, minimal headers)
             # Ethernet: dst/src MAC (fake), proto=0x0800 (IPv4)
-            eth_header = b'\x00\x11\x22\x33\x44\x55\x66\x77\x88\x99\xaa\xbb\x00\x08'  # 14 bytes
+            eth_header = b'\x00\x11\x22\x33\x44\x55\x66\x77\x88\x99\xaa\xbb\x08\x00'  # 14 bytes, EtherType 0x0800
             # IP: version=4, ihl=5, proto=6 (TCP), src/dst IPs (fake)
             src_ip_bytes = struct.pack('!BBBB', 192, 168, 1, random.randint(1, 100))
             dst_ip_bytes = struct.pack('!BBBB', 8, 8, 8, 8)  # Google DNS
-            ip_header = b'\x45\x00\x00\x28\x12\x34\x40\x00\x40\x06\x00\x00' + src_ip_bytes + dst_ip_bytes  # 20 bytes
             # TCP: src/dst ports (80 HTTP), fake flags/seq
-            tcp_header = struct.pack('!HHLLBBHHH', random.randint(50000, 60000), 80, random.randint(1, 1000000), 0, 5<<4, 2, 0, 0, 0)  # 20 bytes
+            tcp_header = struct.pack('!HHLLBBHHH', random.randint(50000, 60000), 80, random.randint(1, 1000000), 0, 5<<4, 0x18, 65535, 0, 0)  # 20 bytes, PSH+ACK
             # Fake payload (e.g., 'GET / HTTP/1.1\r\nAuthorization: Basic ' + base64)
             payload = b'GET / HTTP/1.1\r\nAuthorization: Basic ' + base64.b64encode(b'user:pass123') + b'\r\n\r\n'
+            total_len = IP_HEADER_MIN_SIZE + len(tcp_header) + len(payload)
+            ip_header = b'\x45\x00' + struct.pack('!H', total_len) + b'\x12\x34\x40\x00\x40\x06\x00\x00' + src_ip_bytes + dst_ip_bytes  # 20 bytes
             packet_data = eth_header + ip_header + tcp_header + payload
             
             # Packet header: ts_sec, ts_usec, incl_len, orig_len
@@ -84,9 +96,24 @@ class PurePcapReader:
                 if len(header) < PCAP_HEADER_SIZE:
                     raise ValueError("File too small for PCAP header")
                 
-                magic, major, minor, tz, sigfigs, snaplen, linktype = struct.unpack('<IHHIIII', header)
-                if magic != PCAP_MAGIC:
-                    raise ValueError(f"Unsupported PCAP format (magic: 0x{magic:08x})")
+                # Work out byte order and timestamp resolution from the magic number
+                endian, ts_divisor = None, None
+                for order in ('<', '>'):
+                    magic = struct.unpack(order + 'I', header[:4])[0]
+                    if magic == PCAP_MAGIC:
+                        endian, ts_divisor = order, 1000000.0
+                    elif magic == PCAP_MAGIC_NS:
+                        endian, ts_divisor = order, 1000000000.0
+                    if endian:
+                        break
+                if not endian:
+                    raise ValueError(f"Unsupported capture format (magic: 0x{header[:4].hex()}). "
+                                     "Only classic .pcap is supported; convert pcapng with: "
+                                     "editcap -F pcap in.pcapng out.pcap")
+
+                magic, major, minor, tz, sigfigs, snaplen, linktype = struct.unpack(endian + 'IHHIIII', header)
+                if linktype != LINKTYPE_ETHERNET:
+                    raise ValueError(f"Unsupported link type {linktype}; only Ethernet (1) is supported")
                 
                 print(f"PCAP loaded: Version {major}.{minor}, Link type: {linktype}, Snaplen: {snaplen}")
                 
@@ -97,8 +124,8 @@ class PurePcapReader:
                     if len(pkt_header) < PCAP_PACKET_HEADER_SIZE:
                         break
                     
-                    ts_sec, ts_usec, incl_len, orig_len = struct.unpack('<IIII', pkt_header)
-                    ts = ts_sec + (ts_usec / 1000000.0)
+                    ts_sec, ts_frac, incl_len, orig_len = struct.unpack(endian + 'IIII', pkt_header)
+                    ts = ts_sec + (ts_frac / ts_divisor)
                     
                     raw_data = f.read(incl_len)
                     if len(raw_data) < incl_len:
@@ -114,28 +141,39 @@ class PurePcapReader:
                 print(f"Loaded {packet_count} packets from {self.file_path}")
                 return self.packets
                 
-        except Exception as e:
+        except (OSError, ValueError, struct.error) as e:
             print(f"Error loading PCAP: {e}", file=sys.stderr)
             sys.exit(1)
 
 def parse_ethernet(raw_data):
-    """Parse Ethernet header: dst/src MAC, protocol."""
+    """Parse Ethernet header (skipping any 802.1Q/QinQ VLAN tags) and return the IPv4 payload."""
     if len(raw_data) < ETH_HEADER_SIZE:
         return None
-    eth_header = raw_data[:ETH_HEADER_SIZE]
-    dst_mac, src_mac, proto = struct.unpack('!6s6sH', eth_header)
-    if proto != 0x0800:  # IPv4 only
+    dst_mac, src_mac, proto = struct.unpack('!6s6sH', raw_data[:ETH_HEADER_SIZE])
+    offset = ETH_HEADER_SIZE
+    while proto in ETHERTYPE_VLAN:
+        if len(raw_data) < offset + VLAN_TAG_SIZE:
+            return None
+        proto = struct.unpack('!H', raw_data[offset + 2:offset + 4])[0]
+        offset += VLAN_TAG_SIZE
+    if proto != ETHERTYPE_IPV4:  # IPv4 only
         return None
-    return raw_data[ETH_HEADER_SIZE:]
+    return raw_data[offset:]
 
 def parse_ip(ip_data):
     """Parse IP header: src/dst IP, protocol, header length."""
     if len(ip_data) < IP_HEADER_MIN_SIZE:
         return None
     version_ihl = ip_data[0]
-    ihl = (version_ihl & 0x0F) * 4  # Header length in bytes
-    if ihl < IP_HEADER_MIN_SIZE:
+    if version_ihl >> 4 != 4:
         return None
+    ihl = (version_ihl & 0x0F) * 4  # Header length in bytes
+    if ihl < IP_HEADER_MIN_SIZE or len(ip_data) < ihl:
+        return None
+    total_len = struct.unpack('!H', ip_data[2:4])[0]
+    if ihl <= total_len < len(ip_data):
+        ip_data = ip_data[:total_len]  # Drop Ethernet padding on short frames
+    frag_offset = struct.unpack('!H', ip_data[6:8])[0] & 0x1FFF
     proto = ip_data[9]
     src_ip = '.'.join(str(b) for b in ip_data[12:16])
     dst_ip = '.'.join(str(b) for b in ip_data[16:20])
@@ -143,15 +181,23 @@ def parse_ip(ip_data):
         'src': src_ip,
         'dst': dst_ip,
         'proto': proto,
+        'first_fragment': frag_offset == 0,  # Only the first fragment carries the TCP/UDP header
         'data': ip_data[ihl:]  # Payload
     }
 
 def parse_tcp(transport_data):
-    """Parse TCP header: src/dst port."""
+    """Parse TCP header: src/dst port and header length.
+
+    The header length comes from the data offset field, so packets that carry
+    TCP options (timestamps, SACK, window scaling) are handled correctly.
+    """
     if len(transport_data) < TCP_HEADER_MIN_SIZE:
         return None
     src_port, dst_port = struct.unpack('!HH', transport_data[:4])
-    return src_port, dst_port
+    header_len = (transport_data[12] >> 4) * 4
+    if header_len < TCP_HEADER_MIN_SIZE or header_len > len(transport_data):
+        return None
+    return src_port, dst_port, header_len
 
 def parse_udp(transport_data):
     """Parse UDP header: src/dst port."""
@@ -182,7 +228,9 @@ def extract_metrics(packets):
 
                 # Ports
                 transport = ip_info['data']
-                if ip_info['proto'] == 6:  # TCP
+                if not ip_info['first_fragment']:
+                    pass  # Later fragments have no port header
+                elif ip_info['proto'] == 6:  # TCP
                     ports_info = parse_tcp(transport)
                     if ports_info:
                         dport = ports_info[1]  # Dst port
@@ -213,7 +261,8 @@ def extract_metrics(packets):
 def detect_anomalies(packets):
     """Apply rules using manual parsing."""
     alerts = []
-    src_rates = defaultdict(list)
+    src_times = defaultdict(list)
+    seen_creds = set()
 
     for pkt in packets:
         eth_data = parse_ethernet(pkt['data'])
@@ -223,39 +272,51 @@ def detect_anomalies(packets):
         if not ip_info:
             continue
         src = ip_info['src']
-        src_rates[src].append(pkt['ts'])
+        src_times[src].append(pkt['ts'])
 
-        # Rule 1: DoS - High rate (>500 pkt/min; dummy won't trigger unless many packets)
-        src_times = src_rates[src]
-        if len(src_times) > 0:
-            src_duration_min = (max(src_times) - min(src_times)) / 60
-            src_rate = len(src_times) / src_duration_min if src_duration_min > 0 else 0
-            if src_rate > 500:
-                alerts.append({
-                    'type': 'DoS_Suspicion',
-                    'src_ip': src,
-                    'rate_pkts_min': round(src_rate, 2),
-                    'description': f'High packet rate from {src}: {src_rate:.0f} pkt/min'
-                })
+        # Rule 2: Unencrypted creds (scan TCP payload for HTTP Basic Auth)
+        if ip_info['proto'] != 6 or not ip_info['first_fragment']:
+            continue
+        tcp_info = parse_tcp(ip_info['data'])
+        if not tcp_info:
+            continue
+        payload = ip_info['data'][tcp_info[2]:].decode('utf-8', errors='ignore')  # Skip the real TCP header length
+        if 'Authorization: Basic ' not in payload:
+            continue
+        try:
+            auth_part = payload.split('Authorization: Basic ', 1)[1].split('\n')[0].strip()
+            decoded = base64.b64decode(auth_part, validate=True).decode('utf-8')
+        except (binascii.Error, UnicodeDecodeError, ValueError):
+            continue  # Not valid Base64 credentials
+        if ':' in decoded:
+            user = decoded.split(':', 1)[0]
+            if (src, ip_info['dst'], user) in seen_creds:
+                continue  # One alert per source/destination/user
+            seen_creds.add((src, ip_info['dst'], user))
+            alerts.append({
+                'type': 'Unencrypted_Creds',
+                'src_ip': src,
+                'dst_ip': ip_info['dst'],
+                'details': f'Basic Auth detected: username "{user}" in HTTP payload',
+                'description': 'Potential credential leak over unencrypted HTTP'
+            })
 
-        # Rule 2: Unencrypted creds (scan raw payload for Basic Auth)
-        transport = ip_info['data']
-        if ip_info['proto'] == 6 and len(transport) > 50:  # TCP, assume payload after header
-            try:
-                payload = transport[TCP_HEADER_MIN_SIZE:].decode('utf-8', errors='ignore')  # Skip TCP header
-                if 'Authorization: Basic' in payload:
-                    auth_part = payload.split('Authorization: Basic ')[1].split('\n')[0].strip()
-                    decoded = base64.b64decode(auth_part).decode('utf-8')
-                    if ':' in decoded:
-                        user, _ = decoded.split(':', 1)
-                        alerts.append({
-                            'type': 'Unencrypted_Creds',
-                            'src_ip': src,
-                            'details': f'Basic Auth detected: username "{user}" in HTTP payload',
-                            'description': 'Potential credential leak over unencrypted HTTP'
-                        })
-            except:
-                pass
+    # Rule 1: DoS - sustained high rate from one source, judged once per source.
+    # A minimum sample size avoids false alarms from two packets sent close together.
+    for src, times in src_times.items():
+        if len(times) < DOS_MIN_PACKETS:
+            continue
+        duration_min = (max(times) - min(times)) / 60
+        if duration_min <= 0:
+            continue
+        rate = len(times) / duration_min
+        if rate > DOS_RATE_THRESHOLD:
+            alerts.append({
+                'type': 'DoS_Suspicion',
+                'src_ip': src,
+                'rate_pkts_min': round(rate, 2),
+                'description': f'High packet rate from {src}: {rate:.0f} pkt/min over {len(times)} packets'
+            })
 
     return alerts
 
@@ -291,16 +352,18 @@ def generate_report(metrics, alerts, output_file, csv=False, html=False):
         html_content = f"""
         <html><body>
         <h1>Network Analysis Report</h1>
-        <p>Summary: {report['summary']}</p>
+        <p>Summary: {html_lib.escape(report['summary'])}</p>
         <h2>Alerts ({len(alerts)})</h2>
         <table border="1">
         <tr><th>Type</th><th>Description</th><th>Details</th></tr>
         """
         for alert in alerts:
-            html_content += f"<tr><td>{alert['type']}</td><td>{alert['description']}</td><td>{alert.get('details', 'N/A')}</td></tr>"
+            # Escape everything: usernames and payload text come from untrusted packets
+            html_content += (f"<tr><td>{html_lib.escape(alert['type'])}</td><td>{html_lib.escape(alert['description'])}</td>"
+                             f"<td>{html_lib.escape(alert.get('details', 'N/A'))}</td></tr>")
         html_content += "</table><h2>Top Talkers</h2><ul>"
         for conn, count in metrics['top_talkers'][:5]:
-            html_content += f"<li>{conn[0]} -> {conn[1]}: {count} packets</li>"
+            html_content += f"<li>{html_lib.escape(conn[0])} -&gt; {html_lib.escape(conn[1])}: {count} packets</li>"
         html_content += "</ul></body></html>"
         with open('report.html', 'w') as f:
             f.write(html_content)
@@ -330,7 +393,8 @@ def main():
     print(f"\nQuick Summary:")
     print(f"- Total packets: {metrics['total_packets']}")
     print(f"- Avg rate: {metrics['avg_packets_per_min']:.1f} pkt/min")
-    print(f"- Alerts: {len(alerts)} ({[a['type'] for a in alerts]})")
+    alert_counts = Counter(a['type'] for a in alerts)
+    print(f"- Alerts: {len(alerts)} ({', '.join(f'{t}: {n}' for t, n in alert_counts.items()) or 'none'})")
     if metrics['top_ports']:
         print(f"- Top port: {metrics['top_ports'][0][0]} ({metrics['top_ports'][0][1]} packets)")
 
